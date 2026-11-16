@@ -55,8 +55,8 @@ int main()
     const double buildSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     check(buildSec < 4.0, "wave ROM generation time", "%.2f s, %.2f M samples", buildSec, (double) e.waveRom().totalSamples() / 1e6);
 
-    check(programs().size() == 100 && combinations().size() == 100, "100 programs, 100 combinations", "%.0f / %.0f", (double) programs().size(), (double) combinations().size());
-    { std::set<std::string> names; for (auto& p : programs()) names.insert(p.name); check(names.size() == 100, "all program names unique", "%.0f unique", (double) names.size()); }
+    check(programs().size() == 101 && combinations().size() == 100, "100 programs + User Samples, 100 combinations", "%.0f / %.0f", (double) programs().size(), (double) combinations().size());
+    { std::set<std::string> names; for (auto& p : programs()) names.insert(p.name); check(names.size() == 101, "all program names unique", "%.0f unique", (double) names.size()); }
 
     // ---- pitch accuracy
     for (int note : { 36, 69, 96 })

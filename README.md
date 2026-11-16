@@ -48,3 +48,27 @@ the piano roll.
 `g++ -O2 -std=c++17 -o pcm_test tests/pcm_test.cpp && ./pcm_test`
 
 `tools/gen_levels.cpp` regenerates `Source/Levels.h` (loudness matching of the 100 programs).
+
+
+## Your own sounds (WAV / AIFF / FLAC)
+
+Open the **SAMPLES** tab. Drop files onto the list (they fill slots in order) or press **LOAD WAV...**. 16 slots, up to 20 s each, mono or stereo, any sample rate.
+
+Per slot: root key, fine tune, key range, velocity range, level, pan, low-pass cutoff, attack, release, and a mode:
+- **Gate** - plays while the key is held (playable instrument, no loop).
+- **Loop** - sustains by looping between two markers you drag on the waveform (256-sample crossfade).
+- **One-Shot** - plays to the end, ignores note-off (drums).
+
+Buttons: **DETECT PITCH** sets root + fine tune from the sample, **AUTO-MAP KEYS** spreads pitched slots across the keyboard, **DRUM MAP** puts slot 1..16 on keys C1..D#2, **USE IN PROGRAM** selects the "User Samples" program (P100) on part 1. "User Samples" is also in every part's program list, so it works in Combi and Multi too.
+Samples are stored inside your DAW project / preset (not as links to files).
+
+Use only sounds you made or have the licence to use. None are included.
+
+## 16 touch pads
+
+The **PADS** tab is a 4x4 grid; pad N plays slot N on key 35+N (C1..D#2), so MIDI pads and the keyboard trigger them too. Velocity comes from where you hit the pad (bottom soft, top hard), from real pressure on touch/pen screens when reported, or a fixed value. Several fingers work at once. Press **SET UP PADS** for drum map + Program mode in one click.
+
+## Checks run for this feature
+- `tests/sample_test.cpp`: 29 checks (pitch tracking, loops, one-shots, key/velocity layers, pan, filter, safe bank swap). All pass.
+- `tests/processor_smoke.cpp`: real WAV into slot, pad key sounds (velocity 30 -> peak 0.36, 120 -> 0.64), empty pad silent, samples survive save/restore (120 KB state for a 0.5 s stereo sample), 50 bank swaps during playback.
+- Loaded as a VST3 through JUCE's plugin host: OK.

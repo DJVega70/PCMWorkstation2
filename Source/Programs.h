@@ -37,6 +37,7 @@ struct Combination
 };
 
 constexpr int kNumPrograms = 100, kNumCombis = 100, kNumBases = 25;
+constexpr int kUserProgram = 100, kAllPrograms = 101;   // program 100 = "User Samples" (plays the sample slots)
 
 namespace detail
 {
@@ -82,7 +83,7 @@ inline std::vector<Program> makePrograms()
         mk("Atmosphere", 20, 27, 0.6f, 12, 9, 6, 0.35f, 0.2f, 3000, .20f, 2.0f, .5f, .6f, .8f, .8f, 1.5f, 1.0f, 2.0f, .5f, 1.5f, 0.4f, .04f, 0, .4f, .5f, .6f),
     };
     std::vector<Program> all;
-    all.reserve(100);
+    all.reserve(101);
     for (int v = 0; v < 4; ++v)
         for (auto p : b)
         {
@@ -93,10 +94,13 @@ inline std::vector<Program> makePrograms()
             if (v == 3) { p.det = p.det * 2.2f + 4.0f; p.lvl2 = std::min(1.0f, p.lvl2 * 1.4f + 0.15f); p.cutoff *= 1.1f; p.lfoPitch *= 1.5f; }
             std::snprintf(p.name, sizeof p.name, "%s", nm);
 #ifndef PCM_NO_TRIM
-            p.level *= kLevelTrim[all.size()];   // measured loudness matching (see tools/gen_levels.cpp)
+            if (all.size() < 100) p.level *= kLevelTrim[all.size()];   // measured loudness matching (see tools/gen_levels.cpp)
 #endif
             all.push_back(p);
         }
+    {
+        Program u; std::snprintf(u.name, sizeof u.name, "User Samples"); u.level = 1.0f; all.push_back(u);
+    }
     return all;
 }
 

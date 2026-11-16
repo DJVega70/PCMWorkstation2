@@ -66,6 +66,9 @@ PcmSynthProcessor::PcmSynthProcessor()
       apvts(*this, nullptr, "STATE", createLayout())
 {
     apvts.addParameterListener("combi", this);
+    formats.registerBasicFormats();
+    for (auto& p : padHit) p = 0.0f;
+    published = std::make_shared<const pcm::SampleBank>(slots);
 }
 
 PcmSynthProcessor::~PcmSynthProcessor() { apvts.removeParameterListener("combi", this); cancelPendingUpdate(); }
@@ -143,13 +146,22 @@ void PcmSynthProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
 
     keyboardState.processNextMidiBuffer(midi, 0, n, true);   // on-screen keyboard -> same stream
     applyParameters();
+    {
+        auto pb = std::atomic_load(&published);
+        if (pb != audioBank) { audioBank = pb; engine.setBank(pb); }
+    }
 
     float* l = buffer.getWritePointer(0);
     float* r = buffer.getWritePointer(1);
     int pos = 0;
     auto handle = [this](const juce::MidiMessage& m) {
         const int ch = m.getChannel() - 1;
-        if (m.isNoteOn()) engine.noteOn(ch, m.getNoteNumber(), m.getFloatVelocity());
+        if (m.isNoteOn())
+        {
+            engine.noteOn(ch, m.getNoteNumber(), m.getFloatVelocity());
+            const int pad = m.getNoteNumber() - kPadBase;
+            if (pad >= 0 && pad < 16) padHit[(size_t) pad] = m.getFloatVelocity();
+        }
         else if (m.isNoteOff()) engine.noteOff(ch, m.getNoteNumber());
         else if (m.isPitchWheel()) engine.pitchBend(ch, (float) (m.getPitchWheelValue() - 8192) / 8192.0f);
         else if (m.isController())
@@ -175,7 +187,10 @@ juce::AudioProcessorEditor* PcmSynthProcessor::createEditor() { return new PcmSy
 
 void PcmSynthProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
-    if (auto xml = apvts.copyState().createXml()) copyXmlToBinary(*xml, destData);
+    auto state = apvts.copyState();
+    state.removeChild(state.getChildWithName("SAMPLES"), nullptr);
+    state.appendChild(samplesToTree(), nullptr);
+    if (auto xml = state.createXml()) copyXmlToBinary(*xml, destData);
 }
 
 void PcmSynthProcessor::setStateInformation(const void* data, int sizeInBytes)
@@ -184,9 +199,137 @@ void PcmSynthProcessor::setStateInformation(const void* data, int sizeInBytes)
         if (xml->hasTagName(apvts.state.getType()))
         {
             restoring = true;                      // do not let the restored "combi" overwrite restored parts
-            apvts.replaceState(juce::ValueTree::fromXml(*xml));
+            auto tree = juce::ValueTree::fromXml(*xml);
+            auto smp = tree.getChildWithName("SAMPLES");
+            if (smp.isValid()) tree.removeChild(smp, nullptr);
+            apvts.replaceState(tree);
             restoring = false;
+            if (smp.isValid()) samplesFromTree(smp);
         }
+}
+
+//==============================================================================
+// user samples
+pcm::SampleSlot PcmSynthProcessor::getSlot(int i) const
+{
+    const juce::ScopedLock sl(slotLock);
+    return slots[(size_t) juce::jlimit(0, pcm::kUserSlots - 1, i)];
+}
+
+void PcmSynthProcessor::publishBank()
+{
+    std::atomic_store(&published, std::shared_ptr<const pcm::SampleBank>(std::make_shared<const pcm::SampleBank>(slots)));
+    ++slotsVersion;
+}
+
+void PcmSynthProcessor::setSlot(int i, const pcm::SampleSlot& s)
+{
+    { const juce::ScopedLock sl(slotLock); slots[(size_t) juce::jlimit(0, pcm::kUserSlots - 1, i)] = s; publishBank(); }
+}
+
+bool PcmSynthProcessor::loadSampleFile(int i, const juce::File& f, juce::String& error)
+{
+    std::unique_ptr<juce::AudioFormatReader> rd(formats.createReaderFor(f));
+    if (!rd || rd->lengthInSamples < 2 || rd->sampleRate <= 0) { error = "Could not read " + f.getFileName(); return false; }
+    const juce::int64 cap = (juce::int64) (20.0 * rd->sampleRate);
+    const int frames = (int) std::min<juce::int64>(rd->lengthInSamples, cap);
+    const int chans = (int) std::min<unsigned>(rd->numChannels, 2u);
+    juce::AudioBuffer<float> buf(chans, frames);
+    rd->read(&buf, 0, frames, 0, true, chans > 1);
+    std::vector<float> l(buf.getReadPointer(0), buf.getReadPointer(0) + frames), r;
+    if (chans > 1) r.assign(buf.getReadPointer(1), buf.getReadPointer(1) + frames);
+    {
+        const juce::ScopedLock sl(slotLock);
+        auto& s = slots[(size_t) juce::jlimit(0, pcm::kUserSlots - 1, i)];
+        s.audio = pcm::makeAudio(std::move(l), std::move(r), rd->sampleRate);
+        s.name = f.getFileNameWithoutExtension().toStdString();
+        publishBank();
+    }
+    if (rd->lengthInSamples > cap) error = "Sample was longer than 20 s and was shortened.";
+    return true;
+}
+
+void PcmSynthProcessor::clearSlot(int i)
+{
+    const juce::ScopedLock sl(slotLock);
+    slots[(size_t) juce::jlimit(0, pcm::kUserSlots - 1, i)] = pcm::SampleSlot();
+    publishBank();
+}
+
+void PcmSynthProcessor::doAutoMap() { const juce::ScopedLock sl(slotLock); pcm::autoMapKeys(slots); publishBank(); }
+void PcmSynthProcessor::doDrumMap() { const juce::ScopedLock sl(slotLock); pcm::drumMap(slots, kPadBase); publishBank(); }
+
+bool PcmSynthProcessor::doDetectRoot(int i)
+{
+    const juce::ScopedLock sl(slotLock);
+    auto& s = slots[(size_t) juce::jlimit(0, pcm::kUserSlots - 1, i)];
+    int note; float cents;
+    if (!s.has() || !pcm::detectPitch(*s.audio, note, cents)) return false;
+    s.root = note; s.tune = -cents;   // tune so the sample sounds exactly at the detected key
+    publishBank();
+    return true;
+}
+
+void PcmSynthProcessor::useSamplesInProgramMode()
+{
+    auto setP = [this](const juce::String& id, float real) { if (auto* p = apvts.getParameter(id)) p->setValueNotifyingHost(p->convertTo0to1(real)); };
+    setP("mode", 0.0f); setP("p1prog", (float) pcm::kUserProgram); setP("p1lvl", 0.9f); setP("p1lo", 0.0f); setP("p1hi", 127.0f); setP("p1tr", 0.0f);
+}
+
+juce::ValueTree PcmSynthProcessor::samplesToTree() const
+{
+    juce::ValueTree t("SAMPLES");
+    const juce::ScopedLock sl(slotLock);
+    for (int i = 0; i < pcm::kUserSlots; ++i)
+    {
+        const auto& s = slots[(size_t) i];
+        if (!s.has()) continue;
+        juce::ValueTree v("SLOT");
+        v.setProperty("index", i, nullptr); v.setProperty("name", juce::String(s.name), nullptr);
+        v.setProperty("root", s.root, nullptr); v.setProperty("lo", s.lo, nullptr); v.setProperty("hi", s.hi, nullptr);
+        v.setProperty("velLo", s.velLo, nullptr); v.setProperty("velHi", s.velHi, nullptr);
+        v.setProperty("tune", s.tune, nullptr); v.setProperty("level", s.level, nullptr); v.setProperty("pan", s.pan, nullptr);
+        v.setProperty("mode", s.mode, nullptr); v.setProperty("loopStart", s.loopStart, nullptr); v.setProperty("loopEnd", s.loopEnd, nullptr);
+        v.setProperty("cutoff", s.cutoff, nullptr); v.setProperty("attack", s.attack, nullptr); v.setProperty("release", s.release, nullptr);
+        const auto& a = *s.audio; const int ch = a.stereo() ? 2 : 1; const size_t n = a.frames();
+        v.setProperty("rate", a.rate, nullptr); v.setProperty("channels", ch, nullptr); v.setProperty("frames", (juce::int64) n, nullptr);
+        std::vector<juce::int16> pcm16(n * (size_t) ch);
+        for (size_t k = 0; k < n; ++k)
+        {
+            pcm16[k * (size_t) ch] = (juce::int16) juce::roundToInt(juce::jlimit(-1.0f, 1.0f, a.l[k]) * 32767.0f);
+            if (ch == 2) pcm16[k * 2 + 1] = (juce::int16) juce::roundToInt(juce::jlimit(-1.0f, 1.0f, a.r[k]) * 32767.0f);
+        }
+        v.setProperty("data", juce::Base64::toBase64(pcm16.data(), pcm16.size() * sizeof(juce::int16)), nullptr);
+        t.appendChild(v, nullptr);
+    }
+    return t;
+}
+
+void PcmSynthProcessor::samplesFromTree(const juce::ValueTree& t)
+{
+    const juce::ScopedLock sl(slotLock);
+    for (auto& s : slots) s = pcm::SampleSlot();
+    for (int k = 0; k < t.getNumChildren(); ++k)
+    {
+        const auto v = t.getChild(k);
+        const int i = (int) v.getProperty("index", -1);
+        if (i < 0 || i >= pcm::kUserSlots) continue;
+        const int ch = juce::jlimit(1, 2, (int) v.getProperty("channels", 1)); const size_t n = (size_t) (juce::int64) v.getProperty("frames", 0);
+        juce::MemoryOutputStream out;
+        if (n < 2 || !juce::Base64::convertFromBase64(out, v.getProperty("data").toString()) || out.getDataSize() < n * (size_t) ch * 2) continue;
+        const auto* p = static_cast<const juce::int16*>(out.getData());
+        std::vector<float> l(n), r(ch == 2 ? n : 0);
+        for (size_t j = 0; j < n; ++j) { l[j] = (float) p[j * (size_t) ch] / 32767.0f; if (ch == 2) r[j] = (float) p[j * 2 + 1] / 32767.0f; }
+        auto& s = slots[(size_t) i];
+        s.audio = pcm::makeAudio(std::move(l), std::move(r), (double) v.getProperty("rate", 44100.0));
+        s.name = v.getProperty("name").toString().toStdString();
+        s.root = v.getProperty("root", 60); s.lo = v.getProperty("lo", 0); s.hi = v.getProperty("hi", 127);
+        s.velLo = v.getProperty("velLo", 1); s.velHi = v.getProperty("velHi", 127);
+        s.tune = (float) (double) v.getProperty("tune", 0.0); s.level = (float) (double) v.getProperty("level", 1.0); s.pan = (float) (double) v.getProperty("pan", 0.0);
+        s.mode = v.getProperty("mode", 0); s.loopStart = (float) (double) v.getProperty("loopStart", 0.4); s.loopEnd = (float) (double) v.getProperty("loopEnd", 0.9);
+        s.cutoff = (float) (double) v.getProperty("cutoff", 20000.0); s.attack = (float) (double) v.getProperty("attack", 0.002); s.release = (float) (double) v.getProperty("release", 0.15);
+    }
+    publishBank();
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter() { return new PcmSynthProcessor(); }

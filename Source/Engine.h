@@ -2,6 +2,7 @@
 // PCM-style synth engine: 16 voices, 8 parts (multitimbral), two effect units. No JUCE dependency.
 #include "Effects.h"
 #include "Programs.h"
+#include "SampleTools.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -30,7 +31,11 @@ struct Voice
     float level = 1.0f, gl = 1.0f, gr = 1.0f;
     double ph1 = 0, ph2 = 0, atkPos = 0, tNote = 0, lfoPh = 0;
     int ampStage = 0, fltStage = 0; double ampLvl = 0, fltLvl = 0;
-    double s1 = 0, s2 = 0;
+    double s1 = 0, s2 = 0, s3 = 0, s4 = 0;
+    // user-sample voices
+    bool isSample = false, kill = false; double pos = 0;
+    std::shared_ptr<const Audio> audio;
+    struct SampleParams { int root = 60, mode = 0; float tune = 0, cutoff = 20000, att = 0.002f, rel = 0.15f, loopS = 0.4f, loopE = 0.9f; } sp;
     // control-rate values
     double inc1 = 0, inc2 = 0, atkInc = 0, fG = 0.1, fK = 1.0, ampGain = 0;
 };
@@ -64,10 +69,11 @@ public:
             if (!partListens(p, ch)) continue;
             const PartCfg& pc = parts[(size_t) p];
             if (pc.level <= 0.0001f || note < pc.lo || note > pc.hi) continue;
+            if (std::max(0, std::min(kAllPrograms - 1, pc.prog)) == kUserProgram) { triggerSamples(p, ch, note, vel); continue; }
             Voice& v = allocate();
             v = Voice();
             v.active = true; v.note = note; v.part = p; v.ch = ch; v.vel = vel; v.age = ++ageCounter;
-            v.prog = &progs[(size_t) std::max(0, std::min(kNumPrograms - 1, pc.prog))];
+            v.prog = &progs[(size_t) std::max(0, std::min(kAllPrograms - 1, pc.prog))];
             v.zoneNote = note + pc.transpose;
             v.level = pc.level * v.prog->level;
             const double pn = std::max(-1.0f, std::min(1.0f, pc.pan)) * 0.7853981633974483;   // equal power
@@ -92,7 +98,8 @@ public:
     }
     void pitchBend(int ch, float v) { bend[ch & 15] = v; }
     void modWheel(int ch, float v) { mod[ch & 15] = v; }
-    void allNotesOff() { for (auto& v : voices) if (v.active) v.releasing = true; }
+    void allNotesOff() { for (auto& v : voices) if (v.active) { v.releasing = true; v.kill = true; } }
+    void setBank(std::shared_ptr<const SampleBank> b) { bank = std::move(b); }
     int activeVoices() const { int n = 0; for (auto& v : voices) n += v.active ? 1 : 0; return n; }
 
     // ---------------- audio
@@ -136,6 +143,84 @@ private:
         }
     }
 
+    void triggerSamples(int p, int ch, int note, float vel)
+    {
+        if (!bank) return;
+        const PartCfg& pc = parts[(size_t) p];
+        const int iv = (int) std::lround(vel * 127.0f);
+        for (const auto& s : *bank)
+        {
+            if (!s.has() || note < s.lo || note > s.hi || iv < s.velLo || iv > s.velHi) continue;
+            Voice& v = allocate();
+            v = Voice();
+            v.active = true; v.isSample = true; v.audio = s.audio; v.note = note; v.part = p; v.ch = ch; v.vel = vel; v.age = ++ageCounter;
+            v.zoneNote = note + pc.transpose;
+            v.level = pc.level * s.level;
+            const double pn = std::max(-1.0f, std::min(1.0f, pc.pan + s.pan)) * 0.7853981633974483;
+            v.gl = (float) std::cos(pn + 0.7853981633974483); v.gr = (float) std::sin(pn + 0.7853981633974483);
+            v.sp.root = s.root; v.sp.mode = s.mode; v.sp.tune = s.tune; v.sp.cutoff = s.cutoff; v.sp.att = s.attack; v.sp.rel = s.release;
+            v.sp.loopS = s.loopStart; v.sp.loopE = s.loopEnd;
+        }
+    }
+
+    static inline float hermite(const float* x, int n, double pos)
+    {
+        const int i = (int) pos; const float f = (float) (pos - i);
+        auto at = [&](int k) { return x[std::max(0, std::min(n - 1, k))]; };
+        const float y0 = at(i - 1), y1 = at(i), y2 = at(i + 1), y3 = at(i + 2);
+        const float c1 = 0.5f * (y2 - y0), c2 = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3, c3 = 0.5f * (y3 - y0) + 1.5f * (y1 - y2);
+        return ((c3 * f + c2) * f + c1) * f + y1;
+    }
+
+    void renderSample(Voice& v, float* l, float* r, int n)
+    {
+        const Audio& A = *v.audio; const auto& sp = v.sp;
+        const double frames = (double) A.frames(), invSr = 1.0 / sr, rr = A.rate * invSr;
+        const bool loop = sp.mode == SmpLoop, oneShot = sp.mode == SmpOneShot;
+        const double ls = std::max(0.0, std::min((double) sp.loopS * frames, frames - 66.0));
+        const double le = std::max(ls + 64.0, std::min((double) sp.loopE * frames, frames - 1.0));
+        const double xf = std::min(256.0, 0.5 * (le - ls));
+        const float* L = A.l.data(); const float* R = A.stereo() ? A.r.data() : L; const int N = (int) A.frames();
+        const bool filt = sp.cutoff < std::min(19000.0, 0.45 * sr);
+        const double aA = sp.att * g.attackScale, aR = sp.rel * g.releaseScale;
+        const bool rel = v.releasing && (!oneShot || v.kill);
+        const double velG = 0.4 + 0.6 * v.vel;
+
+        for (int i0 = 0; i0 < n; i0 += kControl)
+        {
+            const int m = std::min(kControl, n - i0);
+            const double bendSemi = ((double) bend[v.ch & 15] + joyX) * g.bendRange;
+            const double ratio = std::exp2(((double) v.zoneNote - sp.root + sp.tune * 0.01 + bendSemi) / 12.0) * rr;
+            double fG = 0, fK = 1.85, gD = 1;
+            if (filt) { fG = std::tan(3.14159265358979 * std::min((double) sp.cutoff, 0.45 * sr) * invSr); gD = 1.0 / (1.0 + fG * (fG + fK)); }
+            for (int i = 0; i < m; ++i)
+            {
+                double pos = v.pos;
+                if (loop && pos >= le) pos -= (le - ls);
+                if (!loop && pos >= frames - 1.0) { v.active = false; return; }
+                float sl = hermite(L, N, pos), sr2 = A.stereo() ? hermite(R, N, pos) : sl;
+                if (loop && pos > le - xf)
+                {
+                    const float t = (float) ((pos - (le - xf)) / xf); const double op = pos - (le - ls);
+                    sl = sl * (1.0f - t) + hermite(L, N, op) * t;
+                    sr2 = A.stereo() ? sr2 * (1.0f - t) + hermite(R, N, op) * t : sl;
+                }
+                v.pos = pos + ratio;
+                double gain = velG;
+                if (!loop) { const double rem = frames - 1.0 - pos; if (rem < 64.0) gain *= std::max(0.0, rem / 64.0); }
+                if (filt)
+                {
+                    double hp = (sl - (fK + fG) * v.s1 - v.s2) * gD, bp = fG * hp + v.s1; v.s1 = fG * hp + bp; double lp = fG * bp + v.s2; v.s2 = fG * bp + lp; sl = (float) lp;
+                    hp = (sr2 - (fK + fG) * v.s3 - v.s4) * gD; bp = fG * hp + v.s3; v.s3 = fG * hp + bp; lp = fG * bp + v.s4; v.s4 = fG * bp + lp; sr2 = (float) lp;
+                }
+                stepEnv(v.ampStage, v.ampLvl, rel, aA, 0.1, 1.0, aR);
+                const float amp = (float) (v.ampLvl * gain * v.level * 1.41421356);
+                l[i0 + i] += sl * amp * v.gl; r[i0 + i] += sr2 * amp * v.gr;
+            }
+            if (rel && v.ampLvl < 1.0e-5) { v.active = false; return; }
+        }
+    }
+
     Voice& allocate()
     {
         for (auto& v : voices) if (!v.active) return v;
@@ -163,6 +248,7 @@ private:
 
     void renderVoice(Voice& v, float* l, float* r, int n)
     {
+        if (v.isSample) { renderSample(v, l, r, n); return; }
         const Program& p = *v.prog;
         const double aA = p.aA * g.attackScale, aR = p.aR * g.releaseScale, fR = p.fR * g.releaseScale;
         const int zone = std::max(0, std::min(kZones - 1, v.zoneNote / 6));
@@ -245,5 +331,6 @@ private:
     std::array<Voice, kVoices> voices;
     float bend[16] = {}, mod[16] = {}; bool pedal[16] = {};
     uint64_t ageCounter = 0;
+    std::shared_ptr<const SampleBank> bank;
 };
 } // namespace pcm
